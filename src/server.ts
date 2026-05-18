@@ -1,6 +1,12 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 import swaggerUi from "swagger-ui-express";
 import { swaggerSpec } from "./config/swagger.js";
 import authRoutes from "./routes/auth.js";
@@ -75,14 +81,53 @@ if (allowAllCors) {
   app.use(cors(corsSettings));
 }
 
+// ── Rate Limiters ─────────────────────────────────────────────────────────
+// Global limiter: 120 req / min per IP (generous, just stops floods)
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please slow down." },
+  skip: () => process.env.NODE_ENV === "test",
+});
+
+// Auth limiter: 10 attempts / 15 min (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please try again in 15 minutes." },
+  skipSuccessfulRequests: true,
+  skip: () => process.env.NODE_ENV === "test",
+});
+
+// Receipt scan limiter: 5 req / min (Gemini API is expensive)
+const scanLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Scan rate limit exceeded. Please wait a moment." },
+  skip: () => process.env.NODE_ENV === "test",
+});
+
+app.use(globalLimiter);
+
+// Serve locally uploaded files (avatar fallback when R2 is not configured)
+app.use("/static", express.static(path.join(__dirname, "../../uploads")));
+
 // Swagger UI
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// Auth routes with logging
-app.use("/auth", logAuthAttempts, authRoutes);
+// Auth routes with logging + brute-force protection
+app.use("/auth", logAuthAttempts, authLimiter, authRoutes);
 app.use("/user", userRoutes);
 app.use("/friends", friendsRoutes);
 app.use("/groups", groupsRoutes);
+// Apply tight limit to the expensive Gemini scan endpoint before the full sessions router
+app.use("/sessions/scan", scanLimiter);
 app.use("/sessions", sessionsRoutes);
 app.use("/users", usersRoutes);
 app.use("/uploads", uploadsRoutes);

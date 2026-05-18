@@ -4,6 +4,8 @@ import { prisma } from "../config/prisma.js";
 import type { Prisma } from "@prisma/client";
 import { authenticateToken, type AuthRequest } from "../middleware/auth.js";
 import { parseReceipt } from "../services/receiptParser.js";
+import { simplifyDebts } from "../services/debtSimplifier.js";
+import { parseOfdHtml } from "../services/ofdParser.js";
 
 const router = Router();
 
@@ -138,6 +140,128 @@ router.post(
       });
     } catch (err) {
       console.error("POST /sessions/scan error", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /sessions/scan-ofd:
+ *   post:
+ *     summary: Parse receipt from an OFD (ofd.soliq.uz) QR-code URL
+ *     tags: [Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [ofdUrl, sessionName]
+ *             properties:
+ *               ofdUrl:
+ *                 type: string
+ *                 example: "https://ofd.soliq.uz/check?qr=..."
+ *               sessionName:
+ *                 type: string
+ *                 example: "Cafe lunch"
+ *     responses:
+ *       200:
+ *         description: Parsed OFD receipt items (same shape as /sessions/scan)
+ *       400:
+ *         description: Missing or invalid ofdUrl
+ *       422:
+ *         description: Could not extract items from the OFD page
+ *       502:
+ *         description: Failed to fetch the OFD receipt page
+ */
+router.post(
+  "/scan-ofd",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const { ofdUrl, sessionName } = req.body || {};
+
+      if (!ofdUrl || typeof ofdUrl !== "string") {
+        return res.status(400).json({ error: "ofdUrl is required" });
+      }
+      if (!ofdUrl.includes("ofd.soliq.uz")) {
+        return res
+          .status(400)
+          .json({ error: "Only ofd.soliq.uz URLs are supported" });
+      }
+
+      const sName =
+        typeof sessionName === "string" && sessionName.trim()
+          ? sessionName.trim()
+          : "OFD Receipt";
+
+      // Fetch the OFD check page
+      let html: string;
+      try {
+        const fetchRes = await fetch(ofdUrl, {
+          headers: {
+            Accept: "text/html,application/xhtml+xml",
+            "User-Agent": "Mozilla/5.0 (compatible; SplitterBot/1.0)",
+            "Accept-Language": "uz,ru;q=0.9,en;q=0.8",
+          },
+          signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 12_000); return c.signal; })(),
+        });
+        if (!fetchRes.ok) {
+          console.warn(
+            `POST /sessions/scan-ofd: OFD returned HTTP ${fetchRes.status}`
+          );
+          return res.status(502).json({
+            error: `OFD page returned HTTP ${fetchRes.status}. Try again later.`,
+          });
+        }
+        html = await fetchRes.text();
+      } catch (fetchErr: any) {
+        console.error("POST /sessions/scan-ofd fetch error:", fetchErr);
+        return res
+          .status(502)
+          .json({ error: "Could not reach ofd.soliq.uz. Check your network." });
+      }
+
+      // Parse the HTML for receipt items
+      const parsedItems = parseOfdHtml(html);
+
+      if (parsedItems.length === 0) {
+        return res.status(422).json({
+          error:
+            "Could not extract items from the OFD receipt page. " +
+            "The page format may have changed — try scanning the receipt photo instead.",
+        });
+      }
+
+      // Create a session record
+      const session = await prisma.session.create({
+        data: { creatorId: req.user.id, status: "ACTIVE" },
+        select: { id: true },
+      });
+
+      const grandTotal = parsedItems.reduce(
+        (sum, it) => sum + it.totalPrice,
+        0
+      );
+
+      return res.json({
+        sessionId: session.id,
+        sessionName: sName,
+        language: "uz",
+        items: parsedItems,
+        summary: {
+          grandTotal: Math.round(grandTotal * 100) / 100,
+          currency: "UZS",
+        },
+        source: "ofd",
+      });
+    } catch (err) {
+      console.error("POST /sessions/scan-ofd error:", err);
       return res.status(500).json({ error: "Server error" });
     }
   }
@@ -423,7 +547,7 @@ router.post(
 
       const session = await prisma.session.findUnique({
         where: { id: Number(sessionId) },
-        select: { id: true, creatorId: true, createdAt: true },
+        select: { id: true, creatorId: true, createdAt: true, groupId: true },
       });
       if (!session) return res.status(404).json({ error: "Session not found" });
       if (session.creatorId !== req.user.id) {
@@ -625,10 +749,13 @@ router.post(
       const responsePayload = {
         sessionId: Number(sessionId),
         sessionName: sessionName || null,
-        status: "finalized",
+        // New sessions start as "active" — only the creator can mark them settled
+        status: "active",
         createdAt: createdAtIso,
         finalizedAt: finalizedAtIso,
         currency,
+        // groupId allows the frontend to surface bills inside group detail screens
+        groupId: session.groupId ?? null,
         totals: {
           currency,
           grandTotal,
@@ -761,6 +888,462 @@ router.get(
       });
     } catch (err) {
       console.error("GET /sessions/history error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /sessions/{sessionId}/status:
+ *   patch:
+ *     summary: Update the settlement status of a finalized session (creator only)
+ *     tags: [Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         schema:
+ *           type: integer
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [status]
+ *             properties:
+ *               status:
+ *                 type: string
+ *                 enum: [done, active]
+ *     responses:
+ *       200:
+ *         description: Status updated
+ */
+router.patch(
+  "/:sessionId/status",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const { status } = req.body;
+      if (!["done", "active"].includes(status)) {
+        return res
+          .status(400)
+          .json({ error: "status must be 'done' or 'active'" });
+      }
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, creatorId: true, payload: true },
+      });
+      if (!entry)
+        return res.status(404).json({ error: "History entry not found" });
+      if (entry.creatorId !== req.user.id)
+        return res.status(403).json({ error: "Forbidden" });
+
+      // Map UI status to payload status value
+      // "done"   → "finalized"  (settled, excluded from balance)
+      // "active" → "active"     (unsettled, included in balance)
+      const payloadStatus = status === "done" ? "finalized" : "active";
+      const updatedPayload: Prisma.JsonObject = {
+        ...(entry.payload as Record<string, unknown>),
+        status: payloadStatus,
+      };
+
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { payload: updatedPayload },
+      });
+
+      return res.json({ ok: true, sessionId, status: payloadStatus });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/status error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+// ─── PATCH /sessions/:sessionId/debts ────────────────────────────────────────
+/**
+ * Save who owes whom for a finalized session.
+ * Body: { debts: [{ from: string, to: string, amount: number }] }
+ * Accepts legacy { debtor, creditor } format and normalises to { from, to }.
+ * Only the session creator can set debts.
+ */
+router.patch(
+  "/:sessionId/debts",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const { debts } = req.body ?? {};
+      if (!Array.isArray(debts)) {
+        return res.status(400).json({ error: "debts must be an array" });
+      }
+
+      // Normalise & validate each debt entry
+      // Accept both { from, to } and legacy { debtor, creditor }
+      const normalised: { from: string; to: string; amount: number; status?: string }[] = [];
+      for (const d of debts) {
+        const from = typeof d?.from === "string" ? d.from : typeof d?.debtor === "string" ? d.debtor : null;
+        const to   = typeof d?.to   === "string" ? d.to   : typeof d?.creditor === "string" ? d.creditor : null;
+        if (!from || !to) {
+          return res.status(400).json({ error: "Each debt must have { from: string, to: string, amount: number (≥0) }" });
+        }
+        if (from === to) {
+          return res.status(400).json({ error: "Debtor and creditor cannot be the same person" });
+        }
+        const amount = typeof d?.amount === "number" && Number.isFinite(d.amount) && d.amount >= 0 ? d.amount : 0;
+        normalised.push({ from, to, amount, ...(d.status ? { status: d.status } : {}) });
+      }
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, creatorId: true, payload: true },
+      });
+      if (!entry) return res.status(404).json({ error: "History entry not found" });
+      if (entry.creatorId !== req.user.id)
+        return res.status(403).json({ error: "Only the session creator can set debts" });
+
+      const updatedPayload: Prisma.JsonObject = {
+        ...(entry.payload as Record<string, unknown>),
+        debts: normalised,
+      };
+
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { payload: updatedPayload },
+      });
+
+      return res.json({ ok: true, sessionId, debts: normalised });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/debts error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+// ─── PATCH /sessions/:sessionId/name ─────────────────────────────────────────
+/**
+ * Rename a session. Only the creator can rename.
+ * Body: { name: string }
+ */
+router.patch(
+  "/:sessionId/name",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const { name } = req.body ?? {};
+      if (!name || typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "name is required" });
+      }
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, creatorId: true, payload: true },
+      });
+      if (!entry) return res.status(404).json({ error: "History entry not found" });
+      if (entry.creatorId !== req.user.id)
+        return res.status(403).json({ error: "Only the session creator can rename" });
+
+      const trimmed = name.trim().slice(0, 100);
+      const updatedPayload: Prisma.JsonObject = {
+        ...(entry.payload as Record<string, unknown>),
+        sessionName: trimmed,
+      };
+
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { sessionName: trimmed, payload: updatedPayload },
+      });
+
+      return res.json({ ok: true, sessionId, sessionName: trimmed });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/name error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+// ─── DELETE /sessions/:sessionId ─────────────────────────────────────────────
+/**
+ * Delete a session history entry. Only the creator can delete.
+ */
+router.delete(
+  "/:sessionId",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, creatorId: true },
+      });
+      if (!entry) return res.status(404).json({ error: "History entry not found" });
+      if (entry.creatorId !== req.user.id)
+        return res.status(403).json({ error: "Only the session creator can delete" });
+
+      await prisma.sessionHistoryEntry.delete({ where: { sessionId } });
+
+      return res.json({ ok: true, sessionId });
+    } catch (err) {
+      console.error("DELETE /sessions/:sessionId error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /sessions/simplify-debts:
+ *   post:
+ *     summary: Compute the minimum set of transactions to settle a list of debts
+ *     tags: [Sessions]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [debts]
+ *             properties:
+ *               debts:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   required: [from, to, amount]
+ *                   properties:
+ *                     from: { type: string, description: "uniqueId of the payer" }
+ *                     to:   { type: string, description: "uniqueId of the payee" }
+ *                     amount: { type: number }
+ *     responses:
+ *       200:
+ *         description: Simplified transaction list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 simplified:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       from: { type: string }
+ *                       to:   { type: string }
+ *                       amount: { type: number }
+ *                 originalCount:    { type: integer }
+ *                 simplifiedCount:  { type: integer }
+ *                 savedTransactions: { type: integer }
+ */
+router.post(
+  "/simplify-debts",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const { debts } = req.body;
+      if (!Array.isArray(debts)) {
+        return res.status(400).json({ error: "debts array required" });
+      }
+      for (const d of debts) {
+        if (
+          typeof d?.from !== "string" ||
+          typeof d?.to !== "string" ||
+          typeof d?.amount !== "number" ||
+          d.amount < 0
+        ) {
+          return res.status(400).json({
+            error:
+              "Each debt must have { from: string, to: string, amount: number (≥0) }",
+          });
+        }
+      }
+
+      const simplified = simplifyDebts(debts);
+      return res.json({
+        simplified,
+        originalCount: debts.length,
+        simplifiedCount: simplified.length,
+        savedTransactions: Math.max(0, debts.length - simplified.length),
+      });
+    } catch (err) {
+      console.error("POST /sessions/simplify-debts error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+// ─── PATCH /sessions/:sessionId/debt-pay ─────────────────────────────────────
+/**
+ * Debtor claims they have paid a specific debt.
+ * Body: { from: string, to: string }  — identifies the debt by the debtor/creditor pair.
+ * Only the debtor (from === caller's uniqueId) may call this.
+ */
+router.patch(
+  "/:sessionId/debt-pay",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const { from, to } = req.body ?? {};
+      if (!from || !to || typeof from !== "string" || typeof to !== "string")
+        return res.status(400).json({ error: "from and to (uniqueId strings) required" });
+
+      // Look up the caller's uniqueId
+      const caller = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { uniqueId: true },
+      });
+      if (!caller) return res.status(404).json({ error: "User not found" });
+      if (caller.uniqueId !== from)
+        return res.status(403).json({ error: "Only the debtor can claim payment" });
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, payload: true },
+      });
+      if (!entry) return res.status(404).json({ error: "Session history not found" });
+
+      const payload = entry.payload as Record<string, unknown>;
+      const debts: any[] = Array.isArray(payload.debts) ? payload.debts : [];
+
+      let found = false;
+      const updatedDebts = debts.map((d: any) => {
+        if (d.from === from && d.to === to) {
+          found = true;
+          return { ...d, status: "claimed", claimedAt: new Date().toISOString() };
+        }
+        return d;
+      });
+
+      if (!found)
+        return res.status(404).json({ error: "Debt not found" });
+
+      const updatedPayload: Prisma.JsonObject = { ...payload, debts: updatedDebts } as Prisma.JsonObject;
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { payload: updatedPayload },
+      });
+
+      return res.json({ ok: true, sessionId, from, to, status: "claimed" });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/debt-pay error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
+  }
+);
+
+// ─── PATCH /sessions/:sessionId/debt-confirm ─────────────────────────────────
+/**
+ * Creditor confirms that a debtor has paid.
+ * Body: { from: string, to: string }  — identifies the debt by the debtor/creditor pair.
+ * Only the creditor (to === caller's uniqueId) may call this.
+ * If all debts in the session are settled after this, the session is auto-marked done.
+ */
+router.patch(
+  "/:sessionId/debt-confirm",
+  authenticateToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+
+      const sessionId = Number(req.params.sessionId);
+      if (!Number.isFinite(sessionId))
+        return res.status(400).json({ error: "Invalid sessionId" });
+
+      const { from, to } = req.body ?? {};
+      if (!from || !to || typeof from !== "string" || typeof to !== "string")
+        return res.status(400).json({ error: "from and to (uniqueId strings) required" });
+
+      // Look up the caller's uniqueId
+      const caller = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { uniqueId: true },
+      });
+      if (!caller) return res.status(404).json({ error: "User not found" });
+      if (caller.uniqueId !== to)
+        return res.status(403).json({ error: "Only the creditor can confirm payment" });
+
+      const entry = await prisma.sessionHistoryEntry.findUnique({
+        where: { sessionId },
+        select: { id: true, payload: true },
+      });
+      if (!entry) return res.status(404).json({ error: "Session history not found" });
+
+      const payload = entry.payload as Record<string, unknown>;
+      const debts: any[] = Array.isArray(payload.debts) ? payload.debts : [];
+
+      let found = false;
+      const updatedDebts = debts.map((d: any) => {
+        if (d.from === from && d.to === to) {
+          found = true;
+          return { ...d, status: "settled", settledAt: new Date().toISOString() };
+        }
+        return d;
+      });
+
+      if (!found)
+        return res.status(404).json({ error: "Debt not found" });
+
+      // Check if ALL debts are now settled
+      const allSettled = updatedDebts.length > 0 &&
+        updatedDebts.every((d: any) => d.status === "settled");
+
+      const newPayloadStatus = allSettled ? "finalized" : payload.status;
+      const updatedPayload: Prisma.JsonObject = {
+        ...payload,
+        debts: updatedDebts,
+        status: newPayloadStatus,
+      } as Prisma.JsonObject;
+
+      await prisma.sessionHistoryEntry.update({
+        where: { sessionId },
+        data: { payload: updatedPayload },
+      });
+
+      return res.json({
+        ok: true,
+        sessionId,
+        from,
+        to,
+        status: "settled",
+        sessionAutoFinalized: allSettled,
+      });
+    } catch (err) {
+      console.error("PATCH /sessions/:sessionId/debt-confirm error:", err);
       return res.status(500).json({ error: "Server error" });
     }
   }

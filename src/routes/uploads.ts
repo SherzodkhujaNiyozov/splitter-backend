@@ -1,9 +1,38 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import multer from "multer";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { authenticateToken } from "../middleware/auth.js";
 import { uploadAvatarObject } from "../config/r2.js";
 import { prisma } from "../config/prisma.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+// Local uploads folder: <project-root>/uploads
+const LOCAL_UPLOADS_DIR = path.join(__dirname, "../../uploads");
+
+function isR2Configured(): boolean {
+  return !!(
+    process.env.R2_ENDPOINT &&
+    process.env.R2_ACCESS_KEY_ID &&
+    process.env.R2_SECRET_ACCESS_KEY &&
+    process.env.R2_BUCKET &&
+    process.env.CDN_BASE_URL
+  );
+}
+
+async function saveLocalFile(
+  key: string,
+  buffer: Buffer
+): Promise<{ key: string; url: string }> {
+  const fullPath = path.join(LOCAL_UPLOADS_DIR, key);
+  await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.promises.writeFile(fullPath, buffer);
+  const base = (process.env.LOCAL_BASE_URL || "http://localhost:3001").replace(/\/$/, "");
+  return { key, url: `${base}/static/${key}` };
+}
 
 type UploadFile = {
   fieldname: string;
@@ -130,7 +159,10 @@ router.post(
       const v = Math.floor(Date.now() / 1000);
       const key = `avatars/${req.user.id}/v${v}/avatar${ext}`;
 
-      const put = await uploadAvatarObject(key, buffer, mimetype);
+      // Upload to R2 if configured, otherwise save locally
+      const put = isR2Configured()
+        ? await uploadAvatarObject(key, buffer, mimetype)
+        : await saveLocalFile(key, buffer);
 
       // Persist URL to user
       await prisma.user.update({
